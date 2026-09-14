@@ -1,0 +1,30 @@
+name: Build sklookup
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-arm64-static:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Compile inside Alpine aarch64
+        run: |
+          docker run --rm --platform linux/arm64 -v $PWD:/workspace -w /workspace alpine:latest sh -c "
+            apk update &&
+            apk add --no-cache clang llvm bpftool libbpf-dev libbpf-static elfutils-dev zlib-dev zlib-static musl-dev gcc make &&
+            make
+          "
+
+      - name: Upload compiled binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sklookup-aarch64
+          path: sklookup
