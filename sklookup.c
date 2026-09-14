@@ -17,6 +17,13 @@
 
 #include "sklookup.skel.h"
 
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_getfd
+#define __NR_pidfd_getfd 438
+#endif
+
 static volatile sig_atomic_t running = 1;
 
 static void sig_handler(int sig)
@@ -25,69 +32,40 @@ static void sig_handler(int sig)
     running = 0;
 }
 
-static int create_listener(void)
-{
-    int fd;
-    int opt = 1;
+/* 根据端口号与 PID，抓取对应的监听 Socket FD */
+static int get_mihomo_socket_fd(int pid, int target_port) {
+    int pidfd = syscall(__NR_pidfd_open, pid, 0);
+    if (pidfd < 0) return -1;
 
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-        .sin_port = htons(31337),
-    };
+    char fd_dir_path[64];
+    snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", pid);
+    DIR *dir = opendir(fd_dir_path);
+    if (!dir) { close(pidfd); return -1; }
 
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        return -1;
-    }
+    struct dirent *entry;
+    int target_sock = -1;
 
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        int remote_fd = atoi(entry->d_name);
+        
+        // 利用 pidfd_getfd 将 Mihomo 的 FD 复制到当前进程
+        int local_fd = syscall(__NR_pidfd_getfd, pidfd, remote_fd, 0);
+        if (local_fd < 0) continue;
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind 31337");
-        close(fd);
-        return -1;
-    }
-
-    if (listen(fd, 16) < 0) {
-        perror("listen");
-        close(fd);
-        return -1;
-    }
-
-    return fd;
-}
-
-static void serve(int fd)
-{
-    printf("[server] listening on 127.0.0.1:31337\n");
-
-    while (running) {
-        int client;
-        char buf[4096];
-
-        client = accept(fd, NULL, NULL);
-        if (client < 0) {
-            if (errno == EINTR)
-                continue;
-            perror("accept");
-            break;
+        struct sockaddr_in addr;
+        socklen_t len = sizeof(addr);
+        if (getsockname(local_fd, (struct sockaddr *)&addr, &len) == 0) {
+            if (ntohs(addr.sin_port) == target_port) {
+                target_sock = local_fd;
+                break; // 成功找到 Mihomo 的监听 Socket
+            }
         }
-
-        printf("[server] connection received via sk_lookup!\n");
-
-        const char *msg = "HELLO FROM SK_LOOKUP\n";
-        send(client, msg, strlen(msg), 0);
-
-        ssize_t n = recv(client, buf, sizeof(buf) - 1, 0);
-        if (n > 0) {
-            buf[n] = '\0';
-            printf("[server] received:\n%s\n", buf);
-        }
-
-        close(client);
+        close(local_fd);
     }
+    closedir(dir);
+    close(pidfd);
+    return target_sock;
 }
 
 int main(void)

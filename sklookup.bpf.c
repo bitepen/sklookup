@@ -4,10 +4,8 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-/* 
- * 存储用户态 31337 监听套接字
- * key = 0, value = listening socket fd
- */
+#define MIHOMO_PORT 7893
+
 struct {
     __uint(type, BPF_MAP_TYPE_SOCKMAP);
     __uint(max_entries, 1);
@@ -21,19 +19,26 @@ int sk_lookup_redirect(struct bpf_sk_lookup *ctx)
     __u32 key = 0;
     struct bpf_sock *sk;
 
-    /* 仅处理 TCP */
+    /* 仅处理 TCP 连接请求 */
     if (ctx->protocol != IPPROTO_TCP)
         return SK_PASS;
 
-    /* local_port 为主机字节序，直接比对 9999 端口 */
-    if (ctx->local_port != 9999)
+    /* 绝对排除发往 Mihomo 监听端口自身的流量，防止内核死锁 */
+    if (ctx->local_port == MIHOMO_PORT)
+        return SK_PASS;
+
+    /* 
+     * 流量放行过滤：
+     * 现阶段可先指定只劫持 80 和 443 进行安全验证；
+     * 验证通过后即可取消注释放行所有端口。
+     */
+    if (ctx->local_port != 80 && ctx->local_port != 443)
         return SK_PASS;
 
     sk = bpf_map_lookup_elem(&redirect_socket, &key);
     if (!sk)
         return SK_PASS;
 
-    /* 覆盖目标套接字并立即释放引用 */
     bpf_sk_assign(ctx, sk, BPF_SK_LOOKUP_F_REPLACE);
     bpf_sk_release(sk);
 
