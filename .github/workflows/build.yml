@@ -19,7 +19,7 @@ jobs:
         run: |
           docker run --rm --platform linux/arm64 -v $PWD:/workspace -w /workspace alpine:latest sh -c "
             apk update &&
-            apk add --no-cache clang llvm bpftool libbpf-dev libbpf-static elfutils-dev zlib-dev zlib-static musl-dev gcc make &&
+            apk add --no-cache clang llvm bpftool libbpf-dev elfutils-dev zlib-dev zlib-static zstd-dev zstd-static musl-dev gcc make &&
             make
           "
 
