@@ -1,16 +1,18 @@
 #define _GNU_SOURCE
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <unistd.h>
+#include <sys/syscall.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -32,47 +34,79 @@ static void sig_handler(int sig)
     running = 0;
 }
 
-/* 根据端口号与 PID，抓取对应的监听 Socket FD */
-static int get_mihomo_socket_fd(int pid, int target_port) {
+/* 
+ * 借助 Linux 6.6 的 pidfd_getfd，直接将 Mihomo 的监听 Socket 克隆到本进程
+ * 完美兼容 IPv4 与 Go 语言默认绑定的 IPv6 (dual-stack) 监听
+ */
+static int get_mihomo_socket_fd(int pid, int target_port)
+{
     int pidfd = syscall(__NR_pidfd_open, pid, 0);
-    if (pidfd < 0) return -1;
+    if (pidfd < 0) {
+        perror("pidfd_open failed");
+        return -1;
+    }
 
     char fd_dir_path[64];
     snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", pid);
     DIR *dir = opendir(fd_dir_path);
-    if (!dir) { close(pidfd); return -1; }
+    if (!dir) {
+        perror("opendir /proc/[pid]/fd failed");
+        close(pidfd);
+        return -1;
+    }
 
     struct dirent *entry;
     int target_sock = -1;
 
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        int remote_fd = atoi(entry->d_name);
-        
-        // 利用 pidfd_getfd 将 Mihomo 的 FD 复制到当前进程
-        int local_fd = syscall(__NR_pidfd_getfd, pidfd, remote_fd, 0);
-        if (local_fd < 0) continue;
+        if (entry->d_name[0] == '.')
+            continue;
 
-        struct sockaddr_in addr;
-        socklen_t len = sizeof(addr);
-        if (getsockname(local_fd, (struct sockaddr *)&addr, &len) == 0) {
-            if (ntohs(addr.sin_port) == target_port) {
+        int remote_fd = atoi(entry->d_name);
+        if (remote_fd <= 2) // 跳过 stdin, stdout, stderr
+            continue;
+
+        int local_fd = syscall(__NR_pidfd_getfd, pidfd, remote_fd, 0);
+        if (local_fd < 0)
+            continue;
+
+        struct sockaddr_storage ss;
+        socklen_t len = sizeof(ss);
+
+        if (getsockname(local_fd, (struct sockaddr *)&ss, &len) == 0) {
+            int port = 0;
+            if (ss.ss_family == AF_INET) {
+                port = ntohs(((struct sockaddr_in *)&ss)->sin_port);
+            } else if (ss.ss_family == AF_INET6) {
+                port = ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+            }
+
+            if (port == target_port) {
                 target_sock = local_fd;
-                break; // 成功找到 Mihomo 的监听 Socket
+                break; // 成功找到 Mihomo 监听对应端口的套接字
             }
         }
         close(local_fd);
     }
+
     closedir(dir);
     close(pidfd);
     return target_sock;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <mihomo_pid> [target_port]\n", argv[0]);
+        return 1;
+    }
+
+    int mihomo_pid = atoi(argv[1]);
+    int target_port = (argc >= 3) ? atoi(argv[2]) : 7891;
+
     struct sklookup_bpf *skel = NULL;
     struct bpf_link *link = NULL;
-    int listener_fd = -1;
+    int mihomo_fd = -1;
     int netns_fd = -1;
     __u32 key = 0;
 
@@ -81,51 +115,70 @@ int main(void)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("[+] creating listener on 31337...\n");
-    listener_fd = create_listener();
-    if (listener_fd < 0)
+    printf("[+] Fetching listening socket for port %d from PID %d...\n", target_port, mihomo_pid);
+    mihomo_fd = get_mihomo_socket_fd(mihomo_pid, target_port);
+    if (mihomo_fd < 0) {
+        fprintf(stderr, "[-] Could not find listening socket on port %d in PID %d\n", target_port, mihomo_pid);
         return 1;
+    }
+    printf("[+] Grabbed socket successfully! Local cloned FD: %d\n", mihomo_fd);
 
     netns_fd = open("/proc/self/ns/net", O_RDONLY);
     if (netns_fd < 0) {
-        perror("open netns");
+        perror("open netns failed");
+        close(mihomo_fd);
         return 1;
     }
 
-    printf("[+] opening BPF skeleton...\n");
+    printf("[+] Loading BPF skeleton...\n");
     skel = sklookup_bpf__open_and_load();
     if (!skel) {
-        fprintf(stderr, "[-] failed to load BPF program\n");
+        fprintf(stderr, "[-] Failed to load BPF program\n");
+        close(mihomo_fd);
+        close(netns_fd);
         return 1;
     }
 
+    // 将克隆到的 Mihomo Socket 注册进 SOCKMAP
     if (bpf_map_update_elem(
             bpf_map__fd(skel->maps.redirect_socket),
             &key,
-            &listener_fd,
+            &mihomo_fd,
             BPF_ANY) < 0) {
-        perror("bpf_map_update_elem");
-        return 1;
+        perror("bpf_map_update_elem failed");
+        goto cleanup;
     }
-
-    printf("[+] listener registered in SOCKMAP\n");
+    printf("[+] Socket registered to SOCKMAP\n");
 
     link = bpf_program__attach_netns(skel->progs.sk_lookup_redirect, netns_fd);
     if (!link) {
-        fprintf(stderr, "[-] failed to attach SK_LOOKUP: %s (errno=%d)\n", strerror(errno), errno);
-        return 1;
+        fprintf(stderr, "[-] Failed to attach SK_LOOKUP: %s (errno=%d)\n", strerror(errno), errno);
+        goto cleanup;
     }
 
-    printf("\n[+] SK_LOOKUP successfully attached!\n");
-    printf("[+] TCP 127.0.0.1:9999 -> 127.0.0.1:31337\n");
-    printf("[+] press Ctrl+C to stop\n\n");
+    printf("\n[+] ==========================================\n");
+    printf("[+] SK_LOOKUP is now ACTIVE!\n");
+    printf("[+] Outbound TCP -> Mihomo (Port %d)\n", target_port);
+    printf("[+] Press Ctrl+C to stop and detach\n");
+    printf("[+] ==========================================\n\n");
 
-    serve(listener_fd);
+    // 维持驻留，直到收到退出信号
+    while (running) {
+        sleep(1);
+    }
 
-    bpf_link__destroy(link);
-    sklookup_bpf__destroy(skel);
-    close(netns_fd);
-    close(listener_fd);
+    printf("\n[+] Detaching and cleaning up...\n");
 
+cleanup:
+    if (link)
+        bpf_link__destroy(link);
+    if (skel)
+        sklookup_bpf__destroy(skel);
+    if (netns_fd >= 0)
+        close(netns_fd);
+    if (mihomo_fd >= 0)
+        close(mihomo_fd);
+
+    printf("[+] Completed. Exited cleanly.\n");
     return 0;
 }

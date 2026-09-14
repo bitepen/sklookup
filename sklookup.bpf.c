@@ -4,7 +4,7 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-#define MIHOMO_PORT 7893
+#define MIHOMO_PORT 7891
 
 struct {
     __uint(type, BPF_MAP_TYPE_SOCKMAP);
