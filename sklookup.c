@@ -1,184 +1,179 @@
 #define _GNU_SOURCE
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <dirent.h>
-#include <sys/socket.h>
-#include <sys/types.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
-
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
-
 #include "sklookup.skel.h"
 
-#ifndef __NR_pidfd_open
-#define __NR_pidfd_open 434
-#endif
-#ifndef __NR_pidfd_getfd
-#define __NR_pidfd_getfd 438
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
 #endif
 
-static volatile sig_atomic_t running = 1;
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
 
-static void sig_handler(int sig)
-{
+static volatile sig_atomic_t g_stop = 0;
+
+static void sig_handler(int sig) {
     (void)sig;
-    running = 0;
+    g_stop = 1;
 }
 
-/* 
- * 借助 Linux 6.6 的 pidfd_getfd，直接将 Mihomo 的监听 Socket 克隆到本进程
- * 完美兼容 IPv4 与 Go 语言默认绑定的 IPv6 (dual-stack) 监听
- */
-static int get_mihomo_socket_fd(int pid, int target_port)
-{
-    int pidfd = syscall(__NR_pidfd_open, pid, 0);
-    if (pidfd < 0) {
-        perror("pidfd_open failed");
-        return -1;
-    }
+/* 遍历目标 PID 的所有 FD，精准寻找监听指定端口的 TCP 套接字 */
+static int get_listening_socket(pid_t target_pid, int target_port) {
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/%d/fd", target_pid);
 
-    char fd_dir_path[64];
-    snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", pid);
-    DIR *dir = opendir(fd_dir_path);
+    DIR *dir = opendir(path);
     if (!dir) {
-        perror("opendir /proc/[pid]/fd failed");
-        close(pidfd);
+        perror("[-] 打开 /proc/<pid>/fd 失败");
         return -1;
     }
 
+    int pidfd = syscall(SYS_pidfd_open, target_pid, 0);
+    if (pidfd < 0) {
+        perror("[-] pidfd_open 失败");
+        closedir(dir);
+        return -1;
+    }
+
+    int matched_fd = -1;
     struct dirent *entry;
-    int target_sock = -1;
 
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.')
             continue;
 
-        int remote_fd = atoi(entry->d_name);
-        if (remote_fd <= 2) // 跳过 stdin, stdout, stderr
-            continue;
+        int fd = atoi(entry->d_name);
+        if (fd <= 2)
+            continue; // 跳过标准输入输出
 
-        int local_fd = syscall(__NR_pidfd_getfd, pidfd, remote_fd, 0);
+        int local_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0);
         if (local_fd < 0)
             continue;
 
-        struct sockaddr_storage ss;
-        socklen_t len = sizeof(ss);
+        // 1. 严格校验 Socket 类型：必须是 SOCK_STREAM (TCP)
+        int sock_type = 0;
+        socklen_t optlen = sizeof(sock_type);
+        if (getsockopt(local_fd, SOL_SOCKET, SO_TYPE, &sock_type, &optlen) < 0 || sock_type != SOCK_STREAM) {
+            close(local_fd);
+            continue;
+        }
 
-        if (getsockname(local_fd, (struct sockaddr *)&ss, &len) == 0) {
-            int port = 0;
+        // 2. 严格校验监听状态：必须处于 LISTEN 状态（避免误抓主动连出的 TCP 客户端套接字）
+        int accepting = 0;
+        optlen = sizeof(accepting);
+        if (getsockopt(local_fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &optlen) < 0 || !accepting) {
+            close(local_fd);
+            continue;
+        }
+
+        // 3. 校验端口：同时兼容 IPv4 (AF_INET) 和 IPv6 双栈 (AF_INET6)
+        struct sockaddr_storage ss;
+        socklen_t slen = sizeof(ss);
+        if (getsockname(local_fd, (struct sockaddr *)&ss, &slen) == 0) {
+            int bound_port = 0;
             if (ss.ss_family == AF_INET) {
-                port = ntohs(((struct sockaddr_in *)&ss)->sin_port);
+                bound_port = ntohs(((struct sockaddr_in *)&ss)->sin_port);
             } else if (ss.ss_family == AF_INET6) {
-                port = ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+                bound_port = ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
             }
 
-            if (port == target_port) {
-                target_sock = local_fd;
-                break; // 成功找到 Mihomo 监听对应端口的套接字
+            if (bound_port == target_port) {
+                matched_fd = local_fd;
+                break; // 成功匹配，终止扫描
             }
         }
+
         close(local_fd);
     }
 
-    closedir(dir);
     close(pidfd);
-    return target_sock;
+    closedir(dir);
+    return matched_fd;
 }
 
-int main(int argc, char **argv)
-{
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <mihomo_pid> [target_port]\n", argv[0]);
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "用法: %s <mihomo_pid> <listen_port>\n", argv[0]);
         return 1;
     }
 
-    int mihomo_pid = atoi(argv[1]);
-    int target_port = (argc >= 3) ? atoi(argv[2]) : 7891;
+    pid_t target_pid = (pid_t)atoi(argv[1]);
+    int target_port = atoi(argv[2]);
 
-    struct sklookup_bpf *skel = NULL;
-    struct bpf_link *link = NULL;
-    int mihomo_fd = -1;
-    int netns_fd = -1;
-    __u32 key = 0;
-
-    libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
-
+    // 注册信号捕获，确保退出的原子性与优雅清理
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("[+] Fetching listening socket for port %d from PID %d...\n", target_port, mihomo_pid);
-    mihomo_fd = get_mihomo_socket_fd(mihomo_pid, target_port);
-    if (mihomo_fd < 0) {
-        fprintf(stderr, "[-] Could not find listening socket on port %d in PID %d\n", target_port, mihomo_pid);
+    printf("[*] 正在从 PID %d 探测端口 %d 的 TCP 监听套接字...\n", target_pid, target_port);
+    int sock_fd = get_listening_socket(target_pid, target_port);
+    if (sock_fd < 0) {
+        fprintf(stderr, "[-] 未找到匹配的监听套接字，请确认 Mihomo 已就绪。\n");
         return 1;
     }
-    printf("[+] Grabbed socket successfully! Local cloned FD: %d\n", mihomo_fd);
+    printf("[+] 成功获取套接字！本地副本 FD: %d\n", sock_fd);
 
-    netns_fd = open("/proc/self/ns/net", O_RDONLY);
-    if (netns_fd < 0) {
-        perror("open netns failed");
-        close(mihomo_fd);
-        return 1;
-    }
-
-    printf("[+] Loading BPF skeleton...\n");
-    skel = sklookup_bpf__open_and_load();
+    // 加载 BPF Skeleton
+    struct sklookup_bpf *skel = sklookup_bpf__open_and_load();
     if (!skel) {
-        fprintf(stderr, "[-] Failed to load BPF program\n");
-        close(mihomo_fd);
-        close(netns_fd);
+        fprintf(stderr, "[-] BPF skeleton 加载失败\n");
+        close(sock_fd);
         return 1;
     }
 
-    // 将克隆到的 Mihomo Socket 注册进 SOCKMAP
-    if (bpf_map_update_elem(
-            bpf_map__fd(skel->maps.redirect_socket),
-            &key,
-            &mihomo_fd,
-            BPF_ANY) < 0) {
-        perror("bpf_map_update_elem failed");
-        goto cleanup;
+    // 更新 SOCKMAP
+    __u32 key = 0;
+    __u64 val = (__u64)sock_fd;
+    int map_fd = bpf_map__fd(skel->maps.redir_map);
+    if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY) < 0) {
+        perror("[-] bpf_map_update_elem 失败");
+        sklookup_bpf__destroy(skel);
+        close(sock_fd);
+        return 1;
     }
-    printf("[+] Socket registered to SOCKMAP\n");
+    printf("[+] 套接字成功注入 SOCKMAP\n");
 
-    link = bpf_program__attach_netns(skel->progs.sk_lookup_redirect, netns_fd);
+    // 打开当前网络命名空间并挂载
+    int netns_fd = open("/proc/self/ns/net", O_RDONLY);
+    if (netns_fd < 0) {
+        perror("[-] 打开 netns 失败");
+        sklookup_bpf__destroy(skel);
+        close(sock_fd);
+        return 1;
+    }
+
+    struct bpf_link *link = bpf_program__attach_netns(skel->progs.lookup_tcp, netns_fd);
     if (!link) {
-        fprintf(stderr, "[-] Failed to attach SK_LOOKUP: %s (errno=%d)\n", strerror(errno), errno);
-        goto cleanup;
+        fprintf(stderr, "[-] bpf_program__attach_netns 挂载失败\n");
+        close(netns_fd);
+        sklookup_bpf__destroy(skel);
+        close(sock_fd);
+        return 1;
     }
 
-    printf("\n[+] ==========================================\n");
-    printf("[+] SK_LOOKUP is now ACTIVE!\n");
-    printf("[+] Outbound TCP -> Mihomo (Port %d)\n", target_port);
-    printf("[+] Press Ctrl+C to stop and detach\n");
-    printf("[+] ==========================================\n\n");
+    printf("[+] sk_lookup 挂载成功！正在守护监听...\n");
 
-    // 维持驻留，直到收到退出信号
-    while (running) {
+    // 挂起主线程，避免空转占用 CPU
+    while (!g_stop) {
         sleep(1);
     }
 
-    printf("\n[+] Detaching and cleaning up...\n");
+    printf("\n[*] 接收到退出信号，正在安全卸载与清理...\n");
+    bpf_link__destroy(link);
+    close(netns_fd);
+    sklookup_bpf__destroy(skel);
+    close(sock_fd);
 
-cleanup:
-    if (link)
-        bpf_link__destroy(link);
-    if (skel)
-        sklookup_bpf__destroy(skel);
-    if (netns_fd >= 0)
-        close(netns_fd);
-    if (mihomo_fd >= 0)
-        close(mihomo_fd);
-
-    printf("[+] Completed. Exited cleanly.\n");
+    printf("[+] 卸载完成，干净退出。\n");
     return 0;
 }
