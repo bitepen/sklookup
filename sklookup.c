@@ -166,7 +166,7 @@ int main(int argc, char **argv)
     printf("[+] ==========================================\n\n");
 
     while (running) {
-        sleep(1);
+        pause();
     }
 
     printf("\n[+] Detaching and cleaning up...\n");
