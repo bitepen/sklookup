@@ -6,7 +6,6 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define MIHOMO_PORT 7891
 
-/* 存放 Mihomo TCP 监听 Socket 的 Sockmap */
 struct {
     __uint(type, BPF_MAP_TYPE_SOCKMAP);
     __uint(max_entries, 1);
@@ -14,40 +13,25 @@ struct {
     __type(value, __u32);
 } redirect_socket SEC(".maps");
 
-/* 存放 Mihomo PID 的单元素配置表，用于旁路自身流量 */
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u32);
-} config_map SEC(".maps");
-
-/* 判断当前系统调用是否来自 Mihomo 自身 */
-static __always_inline int is_mihomo_process(void)
-{
-    __u32 key = 0;
-    __u32 *target_pid = bpf_map_lookup_elem(&config_map, &key);
-    if (target_pid && *target_pid != 0) {
-        __u32 cur_pid = bpf_get_current_pid_tgid() >> 32;
-        if (cur_pid == *target_pid)
-            return 1;
-    }
-    return 0;
-}
-
-/* 1. 业务 TCP 流量透明分发 (sk_lookup) */
 SEC("sk_lookup")
 int sk_lookup_redirect(struct bpf_sk_lookup *ctx)
 {
     __u32 key = 0;
     struct bpf_sock *sk;
 
+    /* 仅处理 TCP 连接请求 */
     if (ctx->protocol != IPPROTO_TCP)
         return SK_PASS;
 
+    /* 绝对排除发往 Mihomo 监听端口自身的流量，防止内核死锁 */
     if (ctx->local_port == MIHOMO_PORT)
         return SK_PASS;
 
+    /* 
+     * 流量放行过滤：
+     * 现阶段可先指定只劫持 80 和 443 进行安全验证；
+     * 验证通过后即可取消注释放行所有端口。
+     */
     if (ctx->local_port != 80 && ctx->local_port != 443)
         return SK_PASS;
 
@@ -59,70 +43,4 @@ int sk_lookup_redirect(struct bpf_sk_lookup *ctx)
     bpf_sk_release(sk);
 
     return SK_PASS;
-}
-
-/* 2. 拦截 IPv4 connect()：将 UDP 53 重定向到 127.0.0.1:1053 */
-SEC("cgroup/connect4")
-int dns_connect4(struct bpf_sock_addr *ctx)
-{
-    if (ctx->protocol != IPPROTO_UDP)
-        return 1;
-
-    if (is_mihomo_process())
-        return 1;
-
-    if (ctx->user_port == bpf_htons(53)) {
-        ctx->user_ip4 = bpf_htonl(0x7f000001); // 127.0.0.1
-        ctx->user_port = bpf_htons(1053);
-    }
-    return 1;
-}
-
-/* 3. 拦截 IPv4 sendmsg()：覆盖无连接 UDP 53 发包 */
-SEC("cgroup/sendmsg4")
-int dns_sendmsg4(struct bpf_sock_addr *ctx)
-{
-    if (ctx->protocol != IPPROTO_UDP)
-        return 1;
-
-    if (is_mihomo_process())
-        return 1;
-
-    if (ctx->user_port == bpf_htons(53)) {
-        ctx->user_ip4 = bpf_htonl(0x7f000001); // 127.0.0.1
-        ctx->user_port = bpf_htons(1053);
-    }
-    return 1;
-}
-
-/* 4. 拦截 IPv6 connect()：发往 53 端口瞬间拒绝，促使系统解析器秒级回退 IPv4 */
-SEC("cgroup/connect6")
-int dns_connect6(struct bpf_sock_addr *ctx)
-{
-    if (ctx->protocol != IPPROTO_UDP)
-        return 1;
-
-    if (is_mihomo_process())
-        return 1;
-
-    if (ctx->user_port == bpf_htons(53))
-        return 0; // 拒绝连接
-
-    return 1;
-}
-
-/* 5. 拦截 IPv6 sendmsg()：覆盖无连接 IPv6 UDP 53 发包 */
-SEC("cgroup/sendmsg6")
-int dns_sendmsg6(struct bpf_sock_addr *ctx)
-{
-    if (ctx->protocol != IPPROTO_UDP)
-        return 1;
-
-    if (is_mihomo_process())
-        return 1;
-
-    if (ctx->user_port == bpf_htons(53))
-        return 0; // 拒绝发包
-
-    return 1;
 }
