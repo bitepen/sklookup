@@ -19,22 +19,19 @@ int sk_lookup_redirect(struct bpf_sk_lookup *ctx)
     __u32 key = 0;
     struct bpf_sock *sk;
 
-    /* 仅处理 TCP 连接请求 */
+    /* 1. 仅处理 TCP 连接请求 */
     if (ctx->protocol != IPPROTO_TCP)
         return SK_PASS;
 
-    /* 绝对排除发往 Mihomo 监听端口自身的流量，防止内核死锁 */
+    /* 2. 排除发往 Mihomo 监听端口自身的流量，防止死锁 */
     if (ctx->local_port == MIHOMO_PORT)
         return SK_PASS;
 
-    /* 
-     * 流量放行过滤：
-     * 现阶段可先指定只劫持 80 和 443 进行安全验证；
-     * 验证通过后即可取消注释放行所有端口。
-     */
-    if (ctx->local_port != 80 && ctx->local_port != 443)
+    /* 3. 排除发往 127.0.0.0/8 回环地址的连接，保护本地 Web 面板与本地服务 */
+    if ((bpf_ntohl(ctx->local_ip4) >> 24) == 127)
         return SK_PASS;
 
+    /* 4. 放开端口限制：将全端口（含 HMS 5228 等）正常派发给 Mihomo */
     sk = bpf_map_lookup_elem(&redirect_socket, &key);
     if (!sk)
         return SK_PASS;

@@ -34,10 +34,6 @@ static void sig_handler(int sig)
     running = 0;
 }
 
-/* 
- * 借助 Linux 6.6 的 pidfd_getfd，直接将 Mihomo 的监听 Socket 克隆到本进程
- * 完美兼容 IPv4 与 Go 语言默认绑定的 IPv6 (dual-stack) 监听
- */
 static int get_mihomo_socket_fd(int pid, int target_port)
 {
     int pidfd = syscall(__NR_pidfd_open, pid, 0);
@@ -63,12 +59,20 @@ static int get_mihomo_socket_fd(int pid, int target_port)
             continue;
 
         int remote_fd = atoi(entry->d_name);
-        if (remote_fd <= 2) // 跳过 stdin, stdout, stderr
+        if (remote_fd <= 2)
             continue;
 
         int local_fd = syscall(__NR_pidfd_getfd, pidfd, remote_fd, 0);
         if (local_fd < 0)
             continue;
+
+        // 仅抓取 TCP (SOCK_STREAM) 套接字，规避同端口 UDP
+        int sock_type = 0;
+        socklen_t type_len = sizeof(sock_type);
+        if (getsockopt(local_fd, SOL_SOCKET, SO_TYPE, &sock_type, &type_len) < 0 || sock_type != SOCK_STREAM) {
+            close(local_fd);
+            continue;
+        }
 
         struct sockaddr_storage ss;
         socklen_t len = sizeof(ss);
@@ -83,7 +87,7 @@ static int get_mihomo_socket_fd(int pid, int target_port)
 
             if (port == target_port) {
                 target_sock = local_fd;
-                break; // 成功找到 Mihomo 监听对应端口的套接字
+                break;
             }
         }
         close(local_fd);
@@ -115,13 +119,13 @@ int main(int argc, char **argv)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("[+] Fetching listening socket for port %d from PID %d...\n", target_port, mihomo_pid);
+    printf("[+] Fetching listening TCP socket for port %d from PID %d...\n", target_port, mihomo_pid);
     mihomo_fd = get_mihomo_socket_fd(mihomo_pid, target_port);
     if (mihomo_fd < 0) {
-        fprintf(stderr, "[-] Could not find listening socket on port %d in PID %d\n", target_port, mihomo_pid);
+        fprintf(stderr, "[-] Could not find listening TCP socket on port %d in PID %d\n", target_port, mihomo_pid);
         return 1;
     }
-    printf("[+] Grabbed socket successfully! Local cloned FD: %d\n", mihomo_fd);
+    printf("[+] Grabbed TCP socket successfully! Local cloned FD: %d\n", mihomo_fd);
 
     netns_fd = open("/proc/self/ns/net", O_RDONLY);
     if (netns_fd < 0) {
@@ -139,7 +143,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // 将克隆到的 Mihomo Socket 注册进 SOCKMAP
     if (bpf_map_update_elem(
             bpf_map__fd(skel->maps.redirect_socket),
             &key,
@@ -148,7 +151,7 @@ int main(int argc, char **argv)
         perror("bpf_map_update_elem failed");
         goto cleanup;
     }
-    printf("[+] Socket registered to SOCKMAP\n");
+    printf("[+] TCP Socket registered to SOCKMAP\n");
 
     link = bpf_program__attach_netns(skel->progs.sk_lookup_redirect, netns_fd);
     if (!link) {
@@ -158,11 +161,10 @@ int main(int argc, char **argv)
 
     printf("\n[+] ==========================================\n");
     printf("[+] SK_LOOKUP is now ACTIVE!\n");
-    printf("[+] Outbound TCP -> Mihomo (Port %d)\n", target_port);
+    printf("[+] All Outbound TCP -> Mihomo (Port %d)\n", target_port);
     printf("[+] Press Ctrl+C to stop and detach\n");
     printf("[+] ==========================================\n\n");
 
-    // 维持驻留，直到收到退出信号
     while (running) {
         sleep(1);
     }
