@@ -34,7 +34,8 @@ static void sig_handler(int sig)
     running = 0;
 }
 
-static int get_mihomo_socket_fd(int pid, int target_port)
+/* 支持按 target_type (SOCK_STREAM / SOCK_DGRAM) 精准克隆套接字 */
+static int get_mihomo_socket_fd(int pid, int target_port, int target_type)
 {
     int pidfd = syscall(__NR_pidfd_open, pid, 0);
     if (pidfd < 0) {
@@ -66,10 +67,9 @@ static int get_mihomo_socket_fd(int pid, int target_port)
         if (local_fd < 0)
             continue;
 
-        // 仅抓取 TCP (SOCK_STREAM) 套接字，规避同端口 UDP
         int sock_type = 0;
         socklen_t type_len = sizeof(sock_type);
-        if (getsockopt(local_fd, SOL_SOCKET, SO_TYPE, &sock_type, &type_len) < 0 || sock_type != SOCK_STREAM) {
+        if (getsockopt(local_fd, SOL_SOCKET, SO_TYPE, &sock_type, &type_len) < 0 || sock_type != target_type) {
             close(local_fd);
             continue;
         }
@@ -110,27 +110,41 @@ int main(int argc, char **argv)
 
     struct sklookup_bpf *skel = NULL;
     struct bpf_link *link = NULL;
-    int mihomo_fd = -1;
+    int tcp_fd = -1;
+    int udp_fd = -1;
     int netns_fd = -1;
-    __u32 key = 0;
+    __u32 key_tcp = 0;
+    __u32 key_udp = 1;
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("[+] Fetching listening TCP socket for port %d from PID %d...\n", target_port, mihomo_pid);
-    mihomo_fd = get_mihomo_socket_fd(mihomo_pid, target_port);
-    if (mihomo_fd < 0) {
-        fprintf(stderr, "[-] Could not find listening TCP socket on port %d in PID %d\n", target_port, mihomo_pid);
+    /* 1. 抓取 TCP 7891 */
+    printf("[+] Fetching TCP socket for port %d from PID %d...\n", target_port, mihomo_pid);
+    tcp_fd = get_mihomo_socket_fd(mihomo_pid, target_port, SOCK_STREAM);
+    if (tcp_fd < 0) {
+        fprintf(stderr, "[-] Could not find TCP socket on port %d in PID %d\n", target_port, mihomo_pid);
         return 1;
     }
-    printf("[+] Grabbed TCP socket successfully! Local cloned FD: %d\n", mihomo_fd);
+    printf("[+] Cloned TCP socket FD: %d\n", tcp_fd);
+
+    /* 2. 抓取 UDP 7891 (TPROXY) */
+    printf("[+] Fetching UDP socket for port %d from PID %d...\n", target_port, mihomo_pid);
+    udp_fd = get_mihomo_socket_fd(mihomo_pid, target_port, SOCK_DGRAM);
+    if (udp_fd < 0) {
+        fprintf(stderr, "[-] Could not find UDP socket on port %d in PID %d\n", target_port, mihomo_pid);
+        close(tcp_fd);
+        return 1;
+    }
+    printf("[+] Cloned UDP socket FD: %d\n", udp_fd);
 
     netns_fd = open("/proc/self/ns/net", O_RDONLY);
     if (netns_fd < 0) {
         perror("open netns failed");
-        close(mihomo_fd);
+        close(tcp_fd);
+        close(udp_fd);
         return 1;
     }
 
@@ -138,20 +152,20 @@ int main(int argc, char **argv)
     skel = sklookup_bpf__open_and_load();
     if (!skel) {
         fprintf(stderr, "[-] Failed to load BPF program\n");
-        close(mihomo_fd);
-        close(netns_fd);
-        return 1;
-    }
-
-    if (bpf_map_update_elem(
-            bpf_map__fd(skel->maps.redirect_socket),
-            &key,
-            &mihomo_fd,
-            BPF_ANY) < 0) {
-        perror("bpf_map_update_elem failed");
         goto cleanup;
     }
-    printf("[+] TCP Socket registered to SOCKMAP\n");
+
+    /* 3. 分别注册到 SOCKMAP */
+    int map_fd = bpf_map__fd(skel->maps.redirect_socket);
+    if (bpf_map_update_elem(map_fd, &key_tcp, &tcp_fd, BPF_ANY) < 0) {
+        perror("bpf_map_update_elem (TCP) failed");
+        goto cleanup;
+    }
+    if (bpf_map_update_elem(map_fd, &key_udp, &udp_fd, BPF_ANY) < 0) {
+        perror("bpf_map_update_elem (UDP) failed");
+        goto cleanup;
+    }
+    printf("[+] Registered TCP(Key 0) & UDP(Key 1) to SOCKMAP\n");
 
     link = bpf_program__attach_netns(skel->progs.sk_lookup_redirect, netns_fd);
     if (!link) {
@@ -161,7 +175,8 @@ int main(int argc, char **argv)
 
     printf("\n[+] ==========================================\n");
     printf("[+] SK_LOOKUP is now ACTIVE!\n");
-    printf("[+] All Outbound TCP -> Mihomo (Port %d)\n", target_port);
+    printf("[+] Outbound TCP -> Mihomo TCP (Port %d)\n", target_port);
+    printf("[+] Outbound UDP/53 -> Mihomo UDP TPROXY (Port %d)\n", target_port);
     printf("[+] Press Ctrl+C to stop and detach\n");
     printf("[+] ==========================================\n\n");
 
@@ -178,8 +193,10 @@ cleanup:
         sklookup_bpf__destroy(skel);
     if (netns_fd >= 0)
         close(netns_fd);
-    if (mihomo_fd >= 0)
-        close(mihomo_fd);
+    if (tcp_fd >= 0)
+        close(tcp_fd);
+    if (udp_fd >= 0)
+        close(udp_fd);
 
     printf("[+] Completed. Exited cleanly.\n");
     return 0;
