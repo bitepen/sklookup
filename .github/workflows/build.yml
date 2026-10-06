@@ -2,7 +2,7 @@ name: Build sklookup
 
 on:
   push:
-    branches: [ "main", "master", "test/hijack-udp-53" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
